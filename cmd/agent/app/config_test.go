@@ -78,7 +78,7 @@ func TestConfigFile(t *testing.T) {
 			HostPort:      "3.3.3.3:6832",
 		},
 	}, cfg.Processors[2])
-	assert.Equal(t, "4.4.4.4:5778", cfg.SamplingServer.HostPort)
+	assert.Equal(t, "4.4.4.4:5778", cfg.HTTPServer.HostPort)
 
 	assert.Equal(
 		t,
