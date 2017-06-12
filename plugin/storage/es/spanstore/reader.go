@@ -7,8 +7,15 @@ import (
 	"github.com/uber/jaeger/storage/spanstore"
 	"errors"
 	"github.com/uber/jaeger/pkg/es"
-	"context"
+	jModel "github.com/uber/jaeger/model/json"
 	"time"
+	jConverter "github.com/uber/jaeger/model/converter/json"
+	"context"
+	"encoding/json"
+)
+
+const (
+	defaultNumTraces = 100
 )
 
 var (
@@ -50,14 +57,50 @@ func NewSpanReader(client es.Client, logger *zap.Logger) *SpanReader {
 
 // GetTrace takes a traceID and returns a Trace associated with that traceID
 func (s *SpanReader) GetTrace(traceID model.TraceID) (*model.Trace, error) {
+	stringTraceID := traceID.String()
+	query := elastic.NewTermQuery("traceID", stringTraceID)
 
+	jaegerIndexName := time.Now().Format("2006-01-02")
+
+	searchService, err := elastic.Client.Search(jaegerIndexName).
+		Type(spanType).
+		Query(query).
+		Do(s.ctx)
+	if err != nil {
+		return err
+	}
+
+	esSpansRaw := searchService.Hits.Hits
+	spans := make([]*model.Span, len(esSpansRaw))
+
+	for i, esSpanRaw := range esSpansRaw {
+		esSpanInByteArray, err := esSpanRaw.Source.MarshalJSON()
+		if err != nil {
+			return err
+		}
+		var jsonSpan jModel.Span
+		err = json.Unmarshal(esSpanInByteArray, &jsonSpan)
+		if err != nil {
+			return err
+		}
+		span, err := jConverter.SpanToDomain(&jsonSpan)
+		if err != nil {
+			return err
+		}
+		spans[i] = span
+	}
+
+	trace := &model.Trace{}
+	trace.Spans = spans
+	return trace, nil
 }
+
 
 // GetServices returns all services traced by Jaeger, ordered by frequency
 func (s *SpanReader) GetServices() ([]string, error) {
 	serviceAggregation := elastic.NewTermsAggregation().
 		Field("serviceName").
-		Size(3000) // ES deprecated size omission for aggregating all. https://github.com/elastic/elasticsearch/issues/18838
+		Size(3000) // Must set to some large number. ES deprecated size omission for aggregating all. https://github.com/elastic/elasticsearch/issues/18838
 
 	jaegerIndexName := time.Now().Format("2006-01-02")
 
@@ -136,5 +179,5 @@ func validateQuery(p *spanstore.TraceQueryParameters) error {
 
 // FindTraces retrieves traces that match the traceQuery
 func (s *SpanReader) FindTraces(query *spanstore.TraceQueryParameters) ([]*model.Trace, error) {
-
+	return nil, nil
 }
