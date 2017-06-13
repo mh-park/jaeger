@@ -1,17 +1,37 @@
+// Copyright (c) 2017 Uber Technologies, Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
 package spanstore
 
 import (
-	"github.com/olivere/elastic"
-	"go.uber.org/zap"
-	"github.com/uber/jaeger/model"
-	"github.com/uber/jaeger/storage/spanstore"
-	"errors"
-	"github.com/uber/jaeger/pkg/es"
-	jModel "github.com/uber/jaeger/model/json"
-	"time"
-	jConverter "github.com/uber/jaeger/model/converter/json"
 	"context"
 	"encoding/json"
+	"errors"
+	"github.com/olivere/elastic"
+	"github.com/uber/jaeger/model"
+	jConverter "github.com/uber/jaeger/model/converter/json"
+	jModel "github.com/uber/jaeger/model/json"
+	"github.com/uber/jaeger/pkg/es"
+	"github.com/uber/jaeger/storage/spanstore"
+	"go.uber.org/zap"
+	"time"
 )
 
 const (
@@ -49,7 +69,7 @@ type SpanReader struct {
 func NewSpanReader(client es.Client, logger *zap.Logger) *SpanReader {
 	ctx := context.Background()
 	return &SpanReader{
-		ctx:	ctx,
+		ctx:    ctx,
 		client: client,
 		logger: logger,
 	}
@@ -57,32 +77,21 @@ func NewSpanReader(client es.Client, logger *zap.Logger) *SpanReader {
 
 // GetTrace takes a traceID and returns a Trace associated with that traceID
 func (s *SpanReader) GetTrace(traceID model.TraceID) (*model.Trace, error) {
-	stringTraceID := traceID.String()
-	query := elastic.NewTermQuery("traceID", stringTraceID)
+	return s.readTrace(traceID.String())
+}
 
-	jaegerIndexName := time.Now().Format("2006-01-02")
+func (s *SpanReader) readTrace(traceID string) (*model.Trace, error) {
+	query := elastic.NewTermQuery("traceID", traceID)
 
-	searchService, err := elastic.Client.Search(jaegerIndexName).
-		Type(spanType).
-		Query(query).
-		Do(s.ctx)
+	esSpansRaw, err := s.executeQuery(query)
 	if err != nil {
 		return err
 	}
 
-	esSpansRaw := searchService.Hits.Hits
 	spans := make([]*model.Span, len(esSpansRaw))
 
 	for i, esSpanRaw := range esSpansRaw {
-		esSpanInByteArray, err := esSpanRaw.Source.MarshalJSON()
-		if err != nil {
-			return err
-		}
-		var jsonSpan jModel.Span
-		err = json.Unmarshal(esSpanInByteArray, &jsonSpan)
-		if err != nil {
-			return err
-		}
+		jsonSpan, err := s.esJSONtoJSONSpanModel(esSpanRaw)
 		span, err := jConverter.SpanToDomain(&jsonSpan)
 		if err != nil {
 			return err
@@ -95,6 +104,18 @@ func (s *SpanReader) GetTrace(traceID model.TraceID) (*model.Trace, error) {
 	return trace, nil
 }
 
+func (s *SpanReader) esJSONtoJSONSpanModel(esSpanRaw *elastic.SearchHit) (*jModel.Span, error) {
+	esSpanInByteArray, err := esSpanRaw.Source.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+	var jsonSpan *jModel.Span
+	err = json.Unmarshal(esSpanInByteArray, jsonSpan)
+	if err != nil {
+		return nil, err
+	}
+	return jsonSpan
+}
 
 // GetServices returns all services traced by Jaeger, ordered by frequency
 func (s *SpanReader) GetServices() ([]string, error) {
@@ -105,9 +126,9 @@ func (s *SpanReader) GetServices() ([]string, error) {
 	jaegerIndexName := time.Now().Format("2006-01-02")
 
 	searchService := elastic.Client.Search(jaegerIndexName). // TODO: do we search multiple indices? how many of the most recent?
-		Type(serviceType).
-		Size(0). // set to 0 because we don't want actual documents.
-		Aggregation("distinct_services", serviceAggregation)
+									Type(serviceType).
+									Size(0). // set to 0 because we don't want actual documents.
+									Aggregation("distinct_services", serviceAggregation)
 
 	searchResult, err := searchService.Do(s.ctx)
 	if err != nil {
@@ -178,6 +199,137 @@ func validateQuery(p *spanstore.TraceQueryParameters) error {
 }
 
 // FindTraces retrieves traces that match the traceQuery
-func (s *SpanReader) FindTraces(query *spanstore.TraceQueryParameters) ([]*model.Trace, error) {
-	return nil, nil
+func (s *SpanReader) FindTraces(traceQuery *spanstore.TraceQueryParameters) ([]*model.Trace, error) {
+	if err := validateQuery(traceQuery); err != nil {
+		return nil, err
+	}
+	if traceQuery.NumTraces == 0 {
+		traceQuery.NumTraces = defaultNumTraces
+	}
+	uniqueTraceIDs, err := s.findTraceIDs(traceQuery, traceQuery.NumTraces)
+	if err != nil {
+		return nil, err
+	}
+	var retMe []*model.Trace
+	for traceID := range uniqueTraceIDs {
+		if len(retMe) >= traceQuery.NumTraces {
+			break
+		}
+		trace, err := s.readTrace(string(traceID))
+		if err != nil {
+			s.logger.Error("Failure to read trace", zap.String("trace_id", string(traceID)), zap.Error(err))
+			continue
+		}
+		retMe = append(retMe, trace)
+	}
+	return retMe, nil
+}
+
+func (s *SpanReader) executeQuery(query elastic.Query) ([]*elastic.SearchHit, error) {
+	jaegerIndexName := time.Now().Format("2006-01-02")
+	searchService, err := elastic.Client.Search(jaegerIndexName).
+		Type(spanType).
+		Query(query).
+		Do(s.ctx)
+	if err != nil {
+		return nil, err
+	}
+	return searchService.Hits.Hits, nil
+}
+
+func (s *SpanReader) findTraceIDs(traceQuery *spanstore.TraceQueryParameters, numOfTraces int) ([]string, error) {
+	// {
+	//     "size": 0,
+	//     "query": {
+	//       "bool": {
+	//         "must": [
+	//           { "match": { "operationName":   "traceQuery.OperationName"      }},
+	//           { "match": { "process.serviceName": "traceQuery.ServiceName" }},
+	//           { "range":  { "timestamp": { "gte": traceQuery.StartTimeMin, "lte": traceQuery.StartTimeMax }}},
+	//           { "range":  { "duration": { "gte": traceQuery.DurationMin, "lte": traceQuery.DurationMax }}},
+	//           { "nested" : {
+	//             "path" : "tags",
+	//             "query" : {
+	//                 "bool" : {
+	//                     "must" : [
+	//                     { "match" : {"tags.key" : "traceQuery.Tags.key"} },
+	//                     { "match" : {"tags.value" : "traceQuery.Tags.value"} }
+	//                     ]
+	//                 }}}}
+	//         ]
+	//       }
+	//     },
+	//     "aggs": { "traceIDs" : { "terms" : {"size":1000,"field": "traceID" }}
+	//     }
+	// }
+	aggregation := elastic.NewTermsAggregation().
+		Size(numOfTraces).
+		Field("traceID")
+
+	boolQuery := elastic.NewBoolQuery()
+
+	//add duration query
+	minDurationMicros := traceQuery.DurationMin.Nanoseconds() / int64(time.Microsecond/time.Nanosecond)
+	maxDurationMicros := (time.Hour * 24).Nanoseconds() / int64(time.Microsecond/time.Nanosecond)
+	if traceQuery.DurationMax != 0 {
+		maxDurationMicros = traceQuery.DurationMax.Nanoseconds() / int64(time.Microsecond/time.Nanosecond)
+	}
+	durationQuery := elastic.NewRangeQuery("duration").Gte(minDurationMicros).Lte(maxDurationMicros)
+	boolQuery.Must(durationQuery)
+
+	//add startTime query
+	minStartTimeMicros := traceQuery.StartTimeMin.Nanosecond() / int(time.Microsecond/time.Nanosecond)
+	maxStartTimeMicros := int((time.Hour * 24).Nanoseconds() / int64(time.Microsecond/time.Nanosecond))
+	if traceQuery.DurationMax != 0 {
+		maxDurationMicros = traceQuery.StartTimeMax.Nanosecond() / int(time.Microsecond/time.Nanosecond)
+	}
+	startTimeQuery := elastic.NewRangeQuery("startTime").Gte(minStartTimeMicros).Lte(maxStartTimeMicros)
+	boolQuery.Must(startTimeQuery)
+
+	//add process.serviceName query
+	if traceQuery.ServiceName != "" {
+		serviceNameQuery := elastic.NewMatchQuery("process.serviceName", traceQuery.ServiceName)
+		boolQuery.Must(serviceNameQuery)
+	}
+
+	//add operationName query
+	if traceQuery.OperationName != "" {
+		operationNameQuery := elastic.NewMatchQuery("operationName", traceQuery.OperationName)
+		boolQuery.Must(operationNameQuery)
+	}
+
+	//add tags query (must be nested) TODO: add log tags query
+	for k, v := range traceQuery.Tags {
+		keyQuery := elastic.NewMatchQuery("tags.key", k)
+		valueQuery := elastic.NewMatchQuery("tags.value", v)
+		tagBoolQuery := elastic.NewBoolQuery().Must(keyQuery, valueQuery)
+		tagQuery := elastic.NewNestedQuery("tags", tagBoolQuery)
+		boolQuery.Must(tagQuery)
+	}
+
+	jaegerIndexName := time.Now().Format("2006-01-02")
+
+	searchService := elastic.Client.Search(jaegerIndexName). // TODO: do we search multiple indices? how many of the most recent?
+									Type(spanType).
+									Size(0). // set to 0 because we don't want actual documents.
+									Aggregation("traceIDs", aggregation)
+
+	searchResult, err := searchService.Do(s.ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	bucket, found := searchResult.Aggregations.Terms("traceIDs")
+	if !found {
+		err = errors.New("Could not find aggregation of services")
+		return nil, err
+	}
+
+	traceIDBuckets := bucket.Buckets
+	traceIDs := make([]string, len(traceIDBuckets))
+
+	for i, keyitem := range traceIDBuckets {
+		traceIDs[i] = keyitem.Key
+	}
+	return traceIDs, nil
 }
